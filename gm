@@ -1,0 +1,302 @@
+const { executeQuery } = require('../config/database');
+
+const solicitacoesController = {
+  // Listar todas as solicitações (filtrado por função do usuário)
+  listarSolicitacoes: async (req, res) => {
+    try {
+      let query = `
+        SELECT s.*, u.nome as solicitante_nome 
+        FROM solicitacoes s
+        JOIN usuarios u ON s.solicitante_id = u.id
+      `;
+      
+      let values = [];
+      
+      // Se não for admin ou gestor, mostrar apenas suas solicitações
+      if (req.usuario.funcao === 'solicitante') {
+        query += ' WHERE s.solicitante_id = ?';
+        values.push(req.usuario.id);
+      }
+      
+      // Ordenar por data (mais recentes primeiro)
+      query += ' ORDER BY s.data_solicitacao DESC';
+      
+      const solicitacoes = await executeQuery({ query, values });
+      
+      // Para cada solicitação, buscar os itens associados
+      for (const solicitacao of solicitacoes) {
+        const itens = await executeQuery({
+          query: `
+            SELECT is.*, ie.nome, ie.codigo 
+            FROM itens_solicitados is
+            JOIN itens_estoque ie ON is.item_id = ie.id
+            WHERE is.solicitacao_id = ?
+          `,
+          values: [solicitacao.id]
+        });
+        
+        solicitacao.itens = itens;
+      }
+      
+      return res.status(200).json({
+        status: 'success',
+        data: solicitacoes
+      });
+    } catch (error) {
+      console.error('Erro ao listar solicitações:', error);
+      return res.status(500).json({
+        status: 'error',
+        message: 'Erro ao buscar solicitações'
+      });
+    }
+  },
+  
+  // Obter detalhes de uma solicitação específica
+  obterSolicitacao: async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+      // Buscar a solicitação
+      const solicitacoes = await executeQuery({
+        query: `
+          SELECT s.*, u.nome as solicitante_nome 
+          FROM solicitacoes s
+          JOIN usuarios u ON s.solicitante_id = u.id
+          WHERE s.id = ?
+        `,
+        values: [id]
+      });
+      
+      if (solicitacoes.length === 0) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Solicitação não encontrada'
+        });
+      }
+      
+      const solicitacao = solicitacoes[0];
+      
+      // Verificar permissão (apenas admin, gestor ou o próprio solicitante)
+      if (
+        req.usuario.funcao === 'solicitante' && 
+        req.usuario.id !== solicitacao.solicitante_id
+      ) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Acesso negado'
+        });
+      }
+      
+      // Buscar os itens da solicitação
+      const itens = await executeQuery({
+        query: `
+          SELECT is.*, ie.nome, ie.codigo 
+          FROM itens_solicitados is
+          JOIN itens_estoque ie ON is.item_id = ie.id
+          WHERE is.solicitacao_id = ?
+        `,
+        values: [id]
+      });
+      
+      solicitacao.itens = itens;
+      
+      return res.status(200).json({
+        status: 'success',
+        data: solicitacao
+      });
+    } catch (error) {
+      console.error('Erro ao obter solicitação:', error);
+      return res.status(500).json({
+        status: 'error',
+        message: 'Erro ao buscar detalhes da solicitação'
+      });
+    }
+  },
+  
+  // Criar nova solicitação
+  criarSolicitacao: async (req, res) => {
+    const { tipo, urgencia, setor, itens, observacoes } = req.body;
+    const solicitante_id = req.usuario.id;
+    
+    // Validação
+    if (!tipo || !urgencia || !setor || !itens || !Array.isArray(itens) || itens.length === 0) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Dados inválidos. Verifique os campos obrigatórios.'
+      });
+    }
+    
+    try {
+      // Iniciar transação
+      await executeQuery({ query: 'START TRANSACTION' });
+      
+      // Inserir a solicitação
+      const resultSolicitacao = await executeQuery({
+        query: `
+          INSERT INTO solicitacoes 
+            (tipo, urgencia, setor, solicitante_id, observacoes) 
+          VALUES (?, ?, ?, ?, ?)
+        `,
+        values: [tipo, urgencia, setor, solicitante_id, observacoes]
+      });
+      
+      const solicitacaoId = resultSolicitacao.insertId;
+      
+      // Inserir os itens da solicitação
+      for (const item of itens) {
+        // Verificar se o item existe no estoque
+        const itemsEstoque = await executeQuery({
+          query: 'SELECT id FROM itens_estoque WHERE nome = ? OR codigo = ?',
+          values: [item.nome, item.codigo || '']
+        });
+        
+        let itemId;
+        
+        if (itemsEstoque.length === 0) {
+          // Inserir novo item no estoque se não existir
+          const novoItem = await executeQuery({
+            query: `
+              INSERT INTO itens_estoque 
+                (codigo, nome, categoria, quantidade, quantidade_minima) 
+              VALUES (?, ?, ?, 0, 5)
+            `,
+            values: [
+              item.codigo || `NEW${Date.now()}`, 
+              item.nome, 
+              item.categoria || 'material'
+            ]
+          });
+          
+          itemId = novoItem.insertId;
+        } else {
+          itemId = itemsEstoque[0].id;
+        }
+        
+        // Inserir item solicitado
+        await executeQuery({
+          query: `
+            INSERT INTO itens_solicitados 
+              (solicitacao_id, item_id, quantidade, justificativa) 
+            VALUES (?, ?, ?, ?)
+          `,
+          values: [
+            solicitacaoId, 
+            itemId, 
+            item.quantidade, 
+            item.justificativa || ''
+          ]
+        });
+      }
+      
+      // Confirmar transação
+      await executeQuery({ query: 'COMMIT' });
+      
+      return res.status(201).json({
+        status: 'success',
+        message: 'Solicitação criada com sucesso',
+        id: solicitacaoId
+      });
+    } catch (error) {
+      // Rollback em caso de erro
+      await executeQuery({ query: 'ROLLBACK' });
+      
+      console.error('Erro ao criar solicitação:', error);
+      return res.status(500).json({
+        status: 'error',
+        message: 'Erro ao criar solicitação'
+      });
+    }
+  },
+  
+  // Atualizar status de uma solicitação (aprovar/negar)
+  atualizarStatus: async (req, res) => {
+    const { id } = req.params;
+    const { status, comentario } = req.body;
+    const aprovado_por = req.usuario.id;
+    
+    // Validação
+    if (!['aprovado', 'negado'].includes(status)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Status inválido. Use "aprovado" ou "negado".'
+      });
+    }
+    
+    try {
+      // Verificar se a solicitação existe
+      const solicitacoes = await executeQuery({
+        query: 'SELECT * FROM solicitacoes WHERE id = ?',
+        values: [id]
+      });
+      
+      if (solicitacoes.length === 0) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Solicitação não encontrada'
+        });
+      }
+      
+      // Atualizar status da solicitação
+      await executeQuery({
+        query: `
+          UPDATE solicitacoes 
+          SET status = ?, 
+              comentario_admin = ?, 
+              aprovado_por = ?, 
+              data_aprovacao = NOW() 
+          WHERE id = ?
+        `,
+        values: [status, comentario, aprovado_por, id]
+      });
+      
+      // Se aprovado, atualizar estoque
+      if (status === 'aprovado') {
+        // Obter itens da solicitação
+        const itensSolicitados = await executeQuery({
+          query: `
+            SELECT is.item_id, is.quantidade 
+            FROM itens_solicitados is
+            WHERE is.solicitacao_id = ?
+          `,
+          values: [id]
+        });
+        
+        // Atualizar estoque para cada item
+        for (const item of itensSolicitados) {
+          await executeQuery({
+            query: `
+              UPDATE itens_estoque 
+              SET quantidade = quantidade - ? 
+              WHERE id = ?
+            `,
+            values: [item.quantidade, item.item_id]
+          });
+          
+          // Atualizar status do item de estoque
+          await executeQuery({
+            query: `
+              UPDATE itens_estoque 
+              SET status = 
+                CASE
+                  WHEN quantidade <= 0 THEN 'esgotado'
+                  WHEN quantidade <= quantidade_minima THEN 'baixo_estoque'
+                  ELSE 'disponivel'
+                END
+              WHERE id = ?
+            `,
+            values: [item.item_id]
+          });
+        }
+      }
+      
+      return res.status(200).json({
+        status: 'success',
+        message: `Solicitação ${status === 'aprovado' ? 'aprovada' : 'negada'} com sucesso`
+      });
+    } catch (error) {
+      console.error('Erro ao atualizar status da solicitação:', error);
+      return res.status(500).json({
+        status: 'error',
+        message: 'Erro ao atualizar status da solicitação'
+      });
+    }
